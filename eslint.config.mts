@@ -35,10 +35,26 @@ export default tseslint.config(
 	},
 	...obsidianmd.configs.recommended,
 	{
-		// Our UI text contains proper nouns and acronyms (Caldera, SSE, API, URL)
-		// that the sentence-case rule rewrites incorrectly.
+		// Our UI text contains proper nouns, acronyms, and identifiers that the
+		// sentence-case rule would otherwise rewrite incorrectly. Allowlist them
+		// rather than disabling the rule. NOTE: supplying `acronyms`/`brands`
+		// *replaces* the plugin defaults, so the defaults we still rely on (URL,
+		// HTTP, SSE, API, Obsidian) are re-listed here explicitly.
 		rules: {
-			'obsidianmd/ui/sentence-case': 'off',
+			'obsidianmd/ui/sentence-case': [
+				'error',
+				{
+					acronyms: ['SSE', 'API', 'URL', 'HTTP', 'HTTPS'],
+					brands: ['Caldera Sync', 'Caldera', 'Obsidian'],
+					// The server env var and example URL are literal identifiers,
+					// not prose, and must keep their casing.
+					ignoreWords: ['CALDERA_API_KEYS'],
+					// Skip strings that are an example URL, or that embed an
+					// UPPER_SNAKE_CASE identifier (e.g. an env-var name) which must
+					// keep its casing rather than be sentence-cased.
+					ignoreRegex: ['^https?://', '[A-Z][A-Z0-9]*(_[A-Z0-9]+)+'],
+				},
+			],
 		},
 	},
 );

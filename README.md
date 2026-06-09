@@ -18,8 +18,9 @@ Obsidian and the Caldera server in step with each other.
 ```
 
 - **Local → server.** When you create, edit, rename, or delete a note, the
-  plugin pushes it to Caldera with an `If-Match` precondition (optimistic
-  concurrency).
+  plugin pushes it to Caldera. Updates and deletes carry an `If-Match`
+  precondition (optimistic concurrency) so a stale write is rejected and
+  resolved as a conflict; the first create of a new note is sent without one.
 - **Server → local.** The plugin subscribes to Caldera's change stream
   (`GET /api/v1/events`, Server-Sent Events) and applies upserts/deletes as they
   arrive. On mobile, or if you prefer, it polls `GET /api/v1/changes` instead.
@@ -51,11 +52,16 @@ in the Caldera repo for the server-side contract.
    - **Live transport** — *SSE* for instant updates (desktop), or *Polling*
      (works everywhere, including mobile).
    - **Conflict handling** — keep both (default), prefer server, or prefer local.
-3. Toggle **Enable sync** on. The status bar shows the connection state
-   (`Caldera: live`, `polling`, `reconciling`, or an error).
+3. Toggle **Enable sync** on. The status bar shows the connection state — one of
+   `Caldera: off`, `Caldera: connecting…`, `Caldera: reconciling…`,
+   `Caldera: live`, `Caldera: polling`, or `Caldera: error`.
 
 On first run the plugin reconciles the whole vault against the server (pulling,
 pushing, or flagging conflicts per note), then switches to the live feed.
+
+You can re-run that reconcile at any time with the **Caldera Sync: Sync now**
+command (open the command palette and search for "Sync now"); it's a handy way
+to force a full resync after being offline.
 
 ## Scope and limitations
 
@@ -66,14 +72,35 @@ pushing, or flagging conflicts per note), then switches to the live feed.
   plugin never reformats your notes.
 - **One server per vault.** The plugin mirrors against a single Caldera server.
 
+## Privacy
+
+- **What's sent.** The full contents of every in-scope note — including
+  frontmatter — and its vault-relative path are sent to the Caldera server you
+  configure, which in turn stores them and backs them up to GitHub. If you set a
+  **Folder**, only notes under that folder leave your device.
+- **Where it goes.** Only to the **Server URL** you enter. The server URL and
+  API key are entirely user-supplied; the plugin contacts no other host and
+  sends no analytics or telemetry of any kind.
+- **Transport.** Over a plain `http://` server (other than localhost) the Bearer
+  API key travels in cleartext — the settings tab warns about this. Use
+  `https://` for any remote server.
+
 ## Development
 
 ```bash
 npm install
-npm run dev     # watch build → main.js
-npm run build   # type-check + production bundle
+npm run dev          # watch build → main.js
+npm run build        # type-check + production bundle
 npm run lint
+npm test             # run the vitest integration suite once
+npm run test:watch   # re-run tests on change
 ```
+
+The vitest suite under [`test/`](test/) drives the real client, SSE stream, and
+sync engine (with an in-memory vault) end to end against a live Caldera server.
+The integration tests are skipped unless a server is configured via the
+`CALDERA_URL` (and `CALDERA_KEY`) environment variables, so `npm test` is safe
+to run in a build-only checkout.
 
 Source layout:
 
@@ -94,3 +121,8 @@ src/
 Copy `main.js`, `manifest.json`, and `styles.css` into
 `<Vault>/.obsidian/plugins/caldera-sync/`, then reload Obsidian and enable the
 plugin under **Settings → Community plugins**.
+
+## License
+
+Released under the [BSD Zero Clause License](LICENSE) (`0BSD`).
+Copyright (c) 2025 Steven Gann.

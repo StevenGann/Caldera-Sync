@@ -42,6 +42,31 @@ export class CalderaSyncSettingTab extends PluginSettingTab {
 		this.plugin = plugin;
 	}
 
+	/**
+	 * Inline validation for the server URL: require an http/https scheme, and warn
+	 * when a non-localhost http:// origin is paired with an API key (the Bearer
+	 * token would travel in cleartext). Empty string = nothing to flag yet.
+	 */
+	private serverUrlWarning(): string {
+		const raw = this.plugin.settings.serverUrl.trim();
+		if (!raw) return '';
+		let url: URL;
+		try {
+			url = new URL(raw);
+		} catch {
+			return 'Invalid URL. Use a full http:// or https:// address.';
+		}
+		if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+			return 'Server URL must use http:// or https://.';
+		}
+		const host = url.hostname;
+		const isLocal = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+		if (url.protocol === 'http:' && !isLocal && this.plugin.settings.apiKey) {
+			return 'Warning: over plain http:// your API key is sent in cleartext. Use https:// for remote servers.';
+		}
+		return '';
+	}
+
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
@@ -57,28 +82,35 @@ export class CalderaSyncSettingTab extends PluginSettingTab {
 				}),
 			);
 
-		new Setting(containerEl)
+		const urlSetting = new Setting(containerEl)
 			.setName('Server URL')
-			.setDesc('Base URL of the Caldera server, with no trailing slash.')
-			.addText((t) =>
-				t
-					.setPlaceholder('http://localhost:8000')
-					.setValue(this.plugin.settings.serverUrl)
-					.onChange(async (v) => {
-						this.plugin.settings.serverUrl = v.replace(/\/+$/, '');
-						await this.plugin.saveSettings();
-					}),
-			);
+			.setDesc('Base URL of the Caldera server, with no trailing slash.');
+		const urlWarning = containerEl.createEl('div', { cls: 'caldera-sync-warning' });
+		const refreshUrlWarning = () => {
+			urlWarning.setText(this.serverUrlWarning());
+		};
+		refreshUrlWarning();
+		urlSetting.addText((t) =>
+			t
+				.setPlaceholder('http://localhost:8000')
+				.setValue(this.plugin.settings.serverUrl)
+				.onChange(async (v) => {
+					this.plugin.settings.serverUrl = v.replace(/\/+$/, '');
+					await this.plugin.saveSettings();
+					refreshUrlWarning();
+				}),
+		);
 
 		new Setting(containerEl)
 			.setName('API key')
 			.setDesc('A Bearer key configured in the server’s CALDERA_API_KEYS.')
 			.addText((t) => {
-				t.setPlaceholder('paste key')
+				t.setPlaceholder('Paste key')
 					.setValue(this.plugin.settings.apiKey)
 					.onChange(async (v) => {
 						this.plugin.settings.apiKey = v.trim();
 						await this.plugin.saveSettings();
+						refreshUrlWarning();
 					});
 				t.inputEl.type = 'password';
 			});
@@ -88,7 +120,7 @@ export class CalderaSyncSettingTab extends PluginSettingTab {
 			.setDesc('Only sync notes under this folder. Leave empty to sync the whole vault.')
 			.addText((t) =>
 				t
-					.setPlaceholder('(whole vault)')
+					.setPlaceholder('(Whole vault)')
 					.setValue(this.plugin.settings.folder)
 					.onChange(async (v) => {
 						this.plugin.settings.folder = v.replace(/^\/+|\/+$/g, '');

@@ -82,6 +82,10 @@ export default class CalderaSyncPlugin extends Plugin {
 	}
 
 	onunload(): void {
+		// Persist cursor/baseline best-effort *before* the awaited teardown, so a
+		// disable/reload can't drop state if Obsidian tears us down without waiting
+		// for the async stop() to settle.
+		void this.state.flush();
 		void this.stopSync();
 	}
 

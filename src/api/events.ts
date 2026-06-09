@@ -14,6 +14,8 @@ export interface StreamHandlers {
 }
 
 const MAX_BACKOFF_MS = 30000;
+/** Abort an SSE connection that goes silent (no data/keepalive) for this long. */
+const SSE_IDLE_TIMEOUT_MS = 45000;
 
 /**
  * Live change subscription. Prefers an SSE stream over `fetch` (instant), and
@@ -83,16 +85,29 @@ export class ChangeStream {
 		const reader = resp.body.getReader();
 		const decoder = new TextDecoder();
 		let buffer = '';
-		for (;;) {
-			const { value, done } = await reader.read();
-			if (done) return; // server closed; loop() will reconnect
-			buffer += decoder.decode(value, { stream: true });
-			let sep: number;
-			while ((sep = buffer.indexOf('\n\n')) !== -1) {
-				const frame = buffer.slice(0, sep);
-				buffer = buffer.slice(sep + 2);
-				await this.handleFrame(frame);
+		// Idle watchdog: if no bytes (not even a keepalive comment) arrive within the
+		// timeout, abort so loop() reconnects rather than hanging on a dead socket.
+		let watchdog = 0;
+		const armWatchdog = () => {
+			if (watchdog) window.clearTimeout(watchdog);
+			watchdog = window.setTimeout(() => this.abort?.abort(), SSE_IDLE_TIMEOUT_MS);
+		};
+		try {
+			armWatchdog();
+			for (;;) {
+				const { value, done } = await reader.read();
+				if (done) return; // server closed; loop() will reconnect
+				armWatchdog(); // any data (frames or keepalive) is liveness
+				buffer += decoder.decode(value, { stream: true });
+				let sep: number;
+				while ((sep = buffer.indexOf('\n\n')) !== -1) {
+					const frame = buffer.slice(0, sep);
+					buffer = buffer.slice(sep + 2);
+					await this.handleFrame(frame);
+				}
 			}
+		} finally {
+			if (watchdog) window.clearTimeout(watchdog);
 		}
 	}
 
@@ -102,7 +117,15 @@ export class ChangeStream {
 			.filter((l) => l.startsWith('data:'))
 			.map((l) => l.slice(5).trim());
 		if (dataLines.length === 0) return; // keepalive comment or id-only frame
-		const ev = JSON.parse(dataLines.join('\n')) as ChangeEvent;
+		let ev: ChangeEvent;
+		try {
+			ev = JSON.parse(dataLines.join('\n')) as ChangeEvent;
+		} catch (err) {
+			// A malformed frame must not kill the stream; log and skip it.
+			console.error('Caldera Sync: dropping unparseable SSE frame', err);
+			return;
+		}
+		if (!ev || typeof ev.type !== 'string') return; // ignore unexpected shapes
 		if (ev.type === 'resync') {
 			await this.handlers.onResync();
 		} else {

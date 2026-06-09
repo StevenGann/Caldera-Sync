@@ -95,6 +95,68 @@ describe.skipIf(!hasServer)('SyncEngine ↔ Caldera (fake vault, live server)', 
 		expect(await client.getRaw(path)).toBeNull();
 	});
 
+	it('adopts a remote upsert whose content equals the local file without a conflict copy', async () => {
+		// SEN-2 regression: a remote upsert that happens to match the existing local
+		// content must be recognised as already-identical (checksum baseline), not
+		// treated as a competing change that spawns a conflict copy.
+		const folder = uniqueFolder();
+		const { client, fake } = await setup(folder);
+		const path = `${folder}/identical.md`;
+		const content = '# same on both sides\n';
+
+		// Push locally first so the vault holds `content` and a baseline is recorded.
+		fake.putLocal(path, content);
+		await waitForAsync(async () => (await client.getRaw(path))?.content === content);
+
+		// Re-PUT the identical content through the API: a remote upsert event arrives
+		// for content the vault already has.
+		await client.putRaw(path, content, (await client.getRaw(path))?.checksum);
+		await new Promise((r) => setTimeout(r, 700));
+
+		expect(fake.paths().filter((p) => p.includes('(conflict'))).toHaveLength(0);
+		expect(fake.getContent(path)).toBe(content);
+	});
+
+	it('renames a note as delete-old + create-new on the server', async () => {
+		// SEN-5: a local rename mirrors as one locked unit — old path removed, new
+		// path created — even when a remote edit could otherwise interleave.
+		const folder = uniqueFolder();
+		const { client, fake } = await setup(folder);
+		const oldPath = `${folder}/before.md`;
+		const newPath = `${folder}/after.md`;
+		const content = '# rename me\n';
+
+		fake.putLocal(oldPath, content);
+		await waitForAsync(async () => (await client.getRaw(oldPath))?.content === content);
+
+		fake.renameLocal(oldPath, newPath);
+		await waitForAsync(async () => (await client.getRaw(newPath))?.content === content);
+		await waitForAsync(async () => (await client.getRaw(oldPath)) === null);
+
+		expect((await client.getRaw(newPath))?.content).toBe(content);
+		expect(await client.getRaw(oldPath)).toBeNull();
+	});
+
+	it('renames a just-adopted remote note without a loop or conflict copy', async () => {
+		// SEN-5: renaming a note immediately after the engine adopted it from the
+		// server must not be mistaken for a competing edit (paired echo bookkeeping).
+		const folder = uniqueFolder();
+		const { client, fake } = await setup(folder);
+		const remotePath = `${folder}/adopted.md`;
+		const renamed = `${folder}/adopted-renamed.md`;
+		const content = '# from the server\n';
+
+		await client.putRaw(remotePath, content); // agent write → adopted into the vault
+		await waitFor(() => fake.getContent(remotePath) === content);
+
+		fake.renameLocal(remotePath, renamed);
+		await waitForAsync(async () => (await client.getRaw(renamed))?.content === content);
+		await waitForAsync(async () => (await client.getRaw(remotePath)) === null);
+
+		expect(fake.paths().filter((p) => p.includes('(conflict'))).toHaveLength(0);
+		expect((await client.getRaw(renamed))?.content).toBe(content);
+	});
+
 	it('keeps both sides on a conflict (conflict-copy)', async () => {
 		const folder = uniqueFolder();
 		const path = `${folder}/conf.md`;

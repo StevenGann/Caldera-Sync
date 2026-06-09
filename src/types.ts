@@ -20,12 +20,15 @@ export interface ManifestEntry {
 }
 
 export interface Manifest {
+	/** Latest stream seq this snapshot reflects; adopted as the cursor after reconcile. */
 	head: number;
 	notes: ManifestEntry[];
 }
 
 export interface ChangesResponse {
+	/** Highest seq available on the server (the newest change). */
 	head: number;
+	/** Oldest seq the server still retains; a `since` below it means we must resync. */
 	floor: number;
 	resync: boolean;
 	events: ChangeEvent[];

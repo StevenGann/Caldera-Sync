@@ -24,6 +24,15 @@ function unquoteEtag(etag: string | undefined): string | undefined {
 	return etag.replace(/^W\//, '').replace(/^"|"$/g, '');
 }
 
+/** Case-insensitive header lookup (Obsidian's requestUrl lowercases header keys). */
+function header(headers: Record<string, string>, name: string): string | undefined {
+	const lower = name.toLowerCase();
+	for (const [k, v] of Object.entries(headers)) {
+		if (k.toLowerCase() === lower) return v;
+	}
+	return undefined;
+}
+
 /**
  * Thin REST wrapper over Caldera. Uses Obsidian's `requestUrl` (no CORS issues,
  * works on desktop and mobile). Non-2xx responses are inspected rather than
@@ -44,11 +53,11 @@ export class CalderaClient {
 	}
 
 	async getManifest(): Promise<Manifest> {
-		const q = this.settings.folder
+		const folderQuery = this.settings.folder
 			? `?folder=${encodeURIComponent(this.settings.folder)}`
 			: '';
 		const r = await requestUrl({
-			url: `${this.base}/manifest${q}`,
+			url: `${this.base}/manifest${folderQuery}`,
 			headers: this.headers(),
 			throw: true,
 		});
@@ -75,7 +84,7 @@ export class CalderaClient {
 		if (r.status >= 400) {
 			throw new Error(`GET ${path} → HTTP ${r.status}`);
 		}
-		const checksum = unquoteEtag(r.headers['etag'] ?? r.headers['ETag']);
+		const checksum = unquoteEtag(header(r.headers, 'etag'));
 		return { content: r.text, checksum: checksum ?? '' };
 	}
 
@@ -101,7 +110,7 @@ export class CalderaClient {
 			throw new Error(`PUT ${path} → HTTP ${r.status}`);
 		}
 		const bodyChecksum = (r.json as { checksum?: string } | undefined)?.checksum;
-		const checksum = bodyChecksum ?? unquoteEtag(r.headers['etag'] ?? r.headers['ETag']);
+		const checksum = bodyChecksum ?? unquoteEtag(header(r.headers, 'etag'));
 		return { ok: true, status: r.status, checksum, conflict: false };
 	}
 

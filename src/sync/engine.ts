@@ -1,4 +1,4 @@
-import { App, Notice, TFile } from 'obsidian';
+import { App, Notice, TFile, normalizePath } from 'obsidian';
 import type { CalderaSyncSettings } from '../settings';
 import type { CalderaClient } from '../api/client';
 import { ChangeStream } from '../api/events';
@@ -17,11 +17,20 @@ import type { ChangeEvent, RawNote, SyncStatusInfo } from '../types';
  * All mutating work runs through a single async lock so applying a remote event
  * and pushing a local edit can never interleave on the same note.
  */
+/**
+ * Sentinel checksum for an expected delete echo (a delete carries no content).
+ * The `echo:` prefix keeps it distinct from any real `sha256:…` checksum.
+ */
+const ECHO_DELETE = 'echo:delete';
+
 export class SyncEngine {
 	private stream: ChangeStream | null = null;
 	private queue: Promise<unknown> = Promise.resolve();
-	private applying = new Map<string, number>();
+	/** path → set of checksums we expect to see echoed back from our own writes. */
+	private applying = new Map<string, Set<string>>();
 	private pushTimers = new Map<string, number>();
+	/** Pending expiry timers for echo expectations, cleared on stop(). */
+	private echoTimers = new Set<number>();
 
 	constructor(
 		private app: App,
@@ -54,6 +63,9 @@ export class SyncEngine {
 		this.stream = null;
 		for (const t of this.pushTimers.values()) window.clearTimeout(t);
 		this.pushTimers.clear();
+		for (const t of this.echoTimers) window.clearTimeout(t);
+		this.echoTimers.clear();
+		this.applying.clear();
 		await this.state.flush();
 	}
 
@@ -66,33 +78,33 @@ export class SyncEngine {
 	private async reconcile(): Promise<void> {
 		this.onStatus({ kind: 'reconciling' });
 		const manifest = await this.client.getManifest();
-		const remote = new Map(manifest.notes.map((n) => [n.path, n.checksum]));
+		const remote = new Map(manifest.notes.map((n) => [normalizePath(n.path), n.checksum]));
 
-		const local = new Map<string, string>();
-		for (const path of this.localPaths()) {
-			const content = await this.readLocal(path);
-			if (content !== null) local.set(path, await checksum(content));
-		}
+		const local = await this.hashLocalFiles();
 
 		const paths = new Set<string>([...remote.keys(), ...local.keys()]);
 		for (const path of paths) {
-			const r = remote.get(path);
-			const l = local.get(path);
-			const s = this.state.get(path);
-			if (r && !l) {
+			// Three-way compare: server checksum vs local checksum vs the baseline
+			// (last agreed checksum). Each branch decides who, if anyone, changed.
+			const remoteSum = remote.get(path);
+			const localSum = local.get(path);
+			const baseSum = this.state.get(path);
+			if (remoteSum && !localSum) {
 				// Present on server, missing locally.
-				if (s !== undefined && s === r) await this.deleteRemote(path, r); // deleted while offline
+				if (baseSum !== undefined && baseSum === remoteSum)
+					await this.deleteRemote(path, remoteSum); // deleted locally while offline
 				else await this.pullToLocal(path);
-			} else if (!r && l) {
+			} else if (!remoteSum && localSum) {
 				// Present locally, missing on server.
-				if (s !== undefined && s === l) await this.trashLocal(path); // remote deleted while offline
+				if (baseSum !== undefined && baseSum === localSum)
+					await this.trashLocal(path); // remote deleted while offline
 				else await this.pushCreate(path);
-			} else if (r && l) {
-				if (r === l) {
-					this.state.set(path, r); // already identical
-				} else if (s === r) {
+			} else if (remoteSum && localSum) {
+				if (remoteSum === localSum) {
+					this.state.set(path, remoteSum); // already identical
+				} else if (baseSum === remoteSum) {
 					await this.pushLocal(path); // only local changed
-				} else if (s === l) {
+				} else if (baseSum === localSum) {
 					await this.pullToLocal(path); // only remote changed
 				} else {
 					await this.resolveConflict(path); // both changed (or no baseline)
@@ -109,18 +121,18 @@ export class SyncEngine {
 			this.state.setCursor(ev.seq);
 			return;
 		}
-		const path = ev.path;
-		try {
-			if (ev.type === 'delete') {
-				if (this.state.get(path) !== undefined || this.localFile(path)) {
-					await this.trashLocal(path);
-				}
-			} else if (ev.type === 'upsert') {
-				await this.applyUpsert(path, ev.checksum);
+		const path = normalizePath(ev.path);
+		if (ev.type === 'delete') {
+			if (this.state.get(path) !== undefined || this.localFile(path)) {
+				await this.trashLocal(path);
 			}
-		} finally {
-			this.state.setCursor(ev.seq);
+		} else if (ev.type === 'upsert') {
+			await this.applyUpsert(path, ev.checksum);
 		}
+		// Advance the cursor only after the event is successfully applied. If apply
+		// throws, the cursor stays put so backoff/reconnect re-delivers this seq
+		// rather than silently skipping it.
+		this.state.setCursor(ev.seq);
 	}
 
 	private async applyUpsert(path: string, evChecksum: string | null): Promise<void> {
@@ -148,9 +160,10 @@ export class SyncEngine {
 	}
 
 	private async adoptRemote(path: string, raw: RawNote): Promise<void> {
-		this.expectEcho(path);
+		const sum = raw.checksum || (await checksum(raw.content));
+		this.expectEcho(path, sum);
 		await this.writeLocal(path, raw.content);
-		this.state.set(path, raw.checksum || (await checksum(raw.content)));
+		this.state.set(path, sum);
 	}
 
 	// ── Local → remote (debounced from vault events) ──────────────────
@@ -169,7 +182,7 @@ export class SyncEngine {
 
 	handleLocalDelete(path: string): void {
 		if (!this.inScope(path)) return;
-		if (this.consumeEcho(path)) return; // our own remote-applied delete
+		if (this.consumeEcho(path, ECHO_DELETE)) return; // our own remote-applied delete
 		const timer = this.pushTimers.get(path);
 		if (timer) {
 			window.clearTimeout(timer);
@@ -181,18 +194,36 @@ export class SyncEngine {
 	handleLocalRename(oldPath: string, newPath: string): void {
 		// Modeled as delete-old + create-new; Caldera rewrites of links arrive as
 		// their own upsert events. (Server-side move is intentionally not used to
-		// avoid double link-rewriting against Obsidian's own.)
-		if (this.inScope(oldPath) && !this.consumeEcho(oldPath)) {
-			void this.withLock(() => this.deleteRemote(oldPath, this.state.get(oldPath)));
+		// avoid double link-rewriting against Obsidian's own.) Both halves run as a
+		// single locked unit so a remote edit can't interleave between them, and the
+		// old path's pending debounce/echo bookkeeping is settled up front.
+		const oldInScope = this.inScope(oldPath);
+		const newInScope = this.inScope(newPath);
+		if (!oldInScope && !newInScope) return;
+
+		// Cancel any pending push for the old path; it's about to disappear.
+		const pending = this.pushTimers.get(oldPath);
+		if (pending) {
+			window.clearTimeout(pending);
+			this.pushTimers.delete(oldPath);
 		}
-		if (this.inScope(newPath)) this.queueLocalUpsert(newPath);
+
+		void this.withLock(async () => {
+			// A rename never originates from the engine (only trashLocal registers an
+			// ECHO_DELETE, and trashing fires a delete — not a rename), so an in-scope
+			// old path is always a genuine user move: delete it remotely.
+			if (oldInScope) {
+				await this.deleteRemote(oldPath, this.state.get(oldPath));
+			}
+			if (newInScope) await this.pushLocal(newPath);
+		});
 	}
 
 	private async pushLocal(path: string): Promise<void> {
-		if (this.consumeEcho(path)) return; // echo of a remote-applied write
 		const content = await this.readLocal(path);
 		if (content === null) return;
 		const local = await checksum(content);
+		if (this.consumeEcho(path, local)) return; // echo of a remote-applied write
 		if (local === this.state.get(path)) return; // nothing actually changed
 		const res = await this.client.putRaw(path, content, this.state.get(path));
 		if (res.conflict) {
@@ -263,15 +294,63 @@ export class SyncEngine {
 		if (!path.endsWith('.md')) return false;
 		const f = this.settings.folder;
 		if (!f) return true;
-		return path === f || path.startsWith(`${f}/`);
+		const folder = normalizePath(f);
+		return path === folder || path.startsWith(`${folder}/`);
 	}
 
 	private localPaths(): string[] {
 		return this.app.vault.getMarkdownFiles().map((f) => f.path).filter((p) => this.inScope(p));
 	}
 
+	/**
+	 * Hash every in-scope local note for the reconcile baseline. Hashing is bounded
+	 * (a fixed number of files in flight) and yields between chunks so a large vault
+	 * can't freeze the UI; files whose mtime+size match the cached baseline reuse the
+	 * cached checksum instead of being re-read and re-hashed. Progress is surfaced
+	 * through the existing "reconciling" status detail.
+	 */
+	private async hashLocalFiles(): Promise<Map<string, string>> {
+		const CONCURRENCY = 8;
+		const local = new Map<string, string>();
+		const files = this.localPaths()
+			.map((p) => this.localFile(p))
+			.filter((f): f is TFile => f !== null);
+		const total = files.length;
+		let done = 0;
+
+		for (let i = 0; i < total; i += CONCURRENCY) {
+			const chunk = files.slice(i, i + CONCURRENCY);
+			await Promise.all(
+				chunk.map(async (file) => {
+					const sum = await this.hashFile(file);
+					if (sum !== null) local.set(file.path, sum);
+				}),
+			);
+			done += chunk.length;
+			if (total > CONCURRENCY) {
+				this.onStatus({ kind: 'reconciling', detail: `${done}/${total}` });
+			}
+			// Yield to the event loop between chunks so a large vault stays responsive.
+			await new Promise((r) => window.setTimeout(r, 0));
+		}
+		return local;
+	}
+
+	/** Checksum a file, reusing the stat cache when mtime+size are unchanged. */
+	private async hashFile(file: TFile): Promise<string | null> {
+		const stat = file.stat;
+		if (stat) {
+			const cached = this.state.cachedChecksum(file.path, stat.mtime, stat.size);
+			if (cached) return cached;
+		}
+		const content = await this.app.vault.read(file);
+		const sum = await checksum(content);
+		if (stat) this.state.setStat(file.path, stat.mtime, stat.size, sum);
+		return sum;
+	}
+
 	private localFile(path: string): TFile | null {
-		const f = this.app.vault.getAbstractFileByPath(path);
+		const f = this.app.vault.getAbstractFileByPath(normalizePath(path));
 		return f instanceof TFile ? f : null;
 	}
 
@@ -284,22 +363,23 @@ export class SyncEngine {
 		await this.ensureFolder(path);
 		const existing = this.localFile(path);
 		if (existing) await this.app.vault.modify(existing, content);
-		else await this.app.vault.create(path, content);
+		else await this.app.vault.create(normalizePath(path), content);
 	}
 
 	private async trashLocal(path: string): Promise<void> {
 		const file = this.localFile(path);
 		if (file) {
-			this.expectEcho(path);
+			this.expectEcho(path, ECHO_DELETE);
 			await this.app.fileManager.trashFile(file);
 		}
 		this.state.delete(path);
 	}
 
 	private async ensureFolder(path: string): Promise<void> {
-		const slash = path.lastIndexOf('/');
+		const normalized = normalizePath(path);
+		const slash = normalized.lastIndexOf('/');
 		if (slash < 0) return;
-		const segments = path.slice(0, slash).split('/');
+		const segments = normalized.slice(0, slash).split('/');
 		let acc = '';
 		for (const seg of segments) {
 			acc = acc ? `${acc}/${seg}` : seg;
@@ -319,25 +399,43 @@ export class SyncEngine {
 		const ts = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
 		const dot = path.lastIndexOf('.');
 		const stem = dot >= 0 ? path.slice(0, dot) : path;
-		return `${stem} (conflict ${ts}).md`;
+		return normalizePath(`${stem} (conflict ${ts}).md`);
 	}
 
 	// ── Echo guard ────────────────────────────────────────────────────
-	private expectEcho(path: string): void {
-		this.applying.set(path, (this.applying.get(path) ?? 0) + 1);
+	// A remote-applied write/delete produces a vault event that flows back into
+	// the engine as if the user had made it. We record the *checksum* we expect
+	// to see echoed (the sentinel ECHO_DELETE for deletes) so suppression matches
+	// the exact change we caused — not merely "some change to this path".
+	private expectEcho(path: string, expected: string): void {
+		let set = this.applying.get(path);
+		if (!set) {
+			set = new Set<string>();
+			this.applying.set(path, set);
+		}
+		set.add(expected);
 		// Safety: drop a never-delivered expectation so it can't swallow a real edit.
-		window.setTimeout(() => {
-			const n = this.applying.get(path);
-			if (n && n > 0) this.applying.set(path, n - 1);
-			if (this.applying.get(path) === 0) this.applying.delete(path);
-		}, 3000);
+		// The expiry must outlast the local-push debounce — otherwise a slow vault
+		// event could fire its own push before the echo we registered here is
+		// consumed, so the invariant is `pushDebounceMs < echoExpiry`. Derive the
+		// window from the debounce (plus a buffer) to keep that coupling explicit.
+		const echoExpiry = Math.max(3000, this.settings.pushDebounceMs + 2000);
+		const timer = window.setTimeout(() => {
+			this.echoTimers.delete(timer);
+			const s = this.applying.get(path);
+			if (s) {
+				s.delete(expected);
+				if (s.size === 0) this.applying.delete(path);
+			}
+		}, echoExpiry);
+		this.echoTimers.add(timer);
 	}
 
-	private consumeEcho(path: string): boolean {
-		const n = this.applying.get(path);
-		if (n && n > 0) {
-			if (n === 1) this.applying.delete(path);
-			else this.applying.set(path, n - 1);
+	private consumeEcho(path: string, actual: string): boolean {
+		const set = this.applying.get(path);
+		if (set?.has(actual)) {
+			set.delete(actual);
+			if (set.size === 0) this.applying.delete(path);
 			return true;
 		}
 		return false;

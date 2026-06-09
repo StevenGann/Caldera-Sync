@@ -1,8 +1,9 @@
-/*
+/* Inline validation message under the Server URL setting. */
+.caldera-sync-warning {
+	color: var(--text-error);
+	margin-bottom: var(--size-4-2);
+}
 
-This CSS file will be included with your plugin, and
-available in the app when your plugin is enabled.
-
-If your plugin does not need CSS, delete this file.
-
-*/
+.caldera-sync-warning:empty {
+	display: none;
+}

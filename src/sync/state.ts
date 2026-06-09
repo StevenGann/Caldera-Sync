@@ -3,14 +3,24 @@
 // the three-way-merge baseline — comparing a side's current checksum against it
 // tells us whether *that* side changed since the last successful sync.
 
+/** Cached file stat → checksum, letting reconcile skip re-hashing unchanged files. */
+export interface StatEntry {
+	mtime: number;
+	size: number;
+	checksum: string;
+}
+
 export interface PersistedState {
 	cursor: number;
 	checksums: Record<string, string>;
+	/** Optional stat cache (mtime+size → checksum) to avoid re-hashing on reconcile. */
+	stats?: Record<string, StatEntry>;
 }
 
 export class SyncState {
 	cursor = 0;
 	private checksums = new Map<string, string>();
+	private stats = new Map<string, StatEntry>();
 	private saveTimer: number | null = null;
 
 	constructor(private persist: (s: PersistedState) => Promise<void>) {}
@@ -18,6 +28,19 @@ export class SyncState {
 	load(s: PersistedState | undefined): void {
 		this.cursor = s?.cursor ?? 0;
 		this.checksums = new Map(Object.entries(s?.checksums ?? {}));
+		this.stats = new Map(Object.entries(s?.stats ?? {}));
+	}
+
+	/** Return the cached checksum for a path if its mtime+size are unchanged. */
+	cachedChecksum(path: string, mtime: number, size: number): string | undefined {
+		const e = this.stats.get(path);
+		return e && e.mtime === mtime && e.size === size ? e.checksum : undefined;
+	}
+
+	/** Record a path's stat → checksum so a later reconcile can skip re-hashing it. */
+	setStat(path: string, mtime: number, size: number, checksum: string): void {
+		this.stats.set(path, { mtime, size, checksum });
+		this.scheduleSave();
 	}
 
 	get(path: string): string | undefined {
@@ -30,7 +53,9 @@ export class SyncState {
 	}
 
 	delete(path: string): void {
-		if (this.checksums.delete(path)) this.scheduleSave();
+		const had = this.checksums.delete(path);
+		const hadStat = this.stats.delete(path);
+		if (had || hadStat) this.scheduleSave();
 	}
 
 	setCursor(seq: number): void {
@@ -40,12 +65,12 @@ export class SyncState {
 		}
 	}
 
-	knownPaths(): string[] {
-		return [...this.checksums.keys()];
-	}
-
 	snapshot(): PersistedState {
-		return { cursor: this.cursor, checksums: Object.fromEntries(this.checksums) };
+		return {
+			cursor: this.cursor,
+			checksums: Object.fromEntries(this.checksums),
+			stats: Object.fromEntries(this.stats),
+		};
 	}
 
 	/** Debounced persistence so a burst of changes writes data.json once. */
