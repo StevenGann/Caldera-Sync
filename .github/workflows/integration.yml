@@ -1,0 +1,70 @@
+name: Integration
+
+# Runs the plugin's integration tests against a real Caldera container, so the
+# REST + SSE contract the sync engine depends on is verified end to end.
+#
+# Image: ghcr.io/stevengann/caldera. There is no :latest tag — `edge` is built
+# from Caldera's main branch (the latest), and vX.Y.Z tags are releases. Pin a
+# version here for fully reproducible runs if you prefer.
+#
+# GHCR access: if the caldera package is public, the pull below needs no auth. If
+# it's private, the repo-scoped GITHUB_TOKEN cannot read another repo's package —
+# add a PAT with read:packages as the secret GHCR_TOKEN and the login step uses it.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+env:
+  CALDERA_IMAGE: ghcr.io/stevengann/caldera:edge
+  CALDERA_API_KEY: ci-integration-key-0001
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # GHCR_TOKEN (a PAT with read:packages) if the package is private and
+          # in another repo; otherwise the default token suffices for a public one.
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Start Caldera
+        run: |
+          docker run -d --name caldera -p 8000:8000 \
+            -e CALDERA_SOURCE=local \
+            -e CALDERA_API_KEYS=${{ env.CALDERA_API_KEY }} \
+            "${CALDERA_IMAGE}"
+
+      - name: Wait for readiness
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS localhost:8000/readyz | grep -q '"ready":true'; then
+              echo "Caldera ready"; exit 0
+            fi
+            sleep 1
+          done
+          echo "Caldera did not become ready"; docker logs caldera; exit 1
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.x
+          cache: 'npm'
+
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+        env:
+          CALDERA_URL: http://localhost:8000
+          CALDERA_KEY: ${{ env.CALDERA_API_KEY }}
+
+      - name: Caldera logs
+        if: always()
+        run: docker logs caldera

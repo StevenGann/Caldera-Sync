@@ -14,6 +14,10 @@ export default tseslint.config(
 		'package.json',
 		'package-lock.json',
 		'tsconfig.json',
+		// Node test code (Vitest) — not Obsidian-runtime plugin code, so the
+		// obsidian-specific rules (window timers, no-fetch) don't apply.
+		'test/**',
+		'vitest.config.ts',
 	]),
 	{
 		languageOptions: {
