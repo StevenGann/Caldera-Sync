@@ -1,114 +1,140 @@
+import { Notice, Plugin, TFile } from 'obsidian';
 import {
-	Editor,
-	MarkdownView,
-	MarkdownFileInfo,
-	Modal,
-	Notice,
-	Plugin,
-} from 'obsidian';
-import {
+	CalderaSyncSettings,
+	CalderaSyncSettingTab,
 	DEFAULT_SETTINGS,
-	MyPluginSettings,
-	SampleSettingTab,
 } from './settings';
+import { CalderaClient } from './api/client';
+import { SyncEngine } from './sync/engine';
+import { SyncState, type PersistedState } from './sync/state';
+import type { SyncStatusInfo } from './types';
 
-// Remember to rename these classes and interfaces!
-
-export default class MyPlugin extends Plugin {
-	settings!: MyPluginSettings;
-
-	async onload() {
-		await this.loadSettings();
-
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (_evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
-
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			},
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (
-				editor: Editor,
-				_ctx: MarkdownView | MarkdownFileInfo,
-			) => {
-				editor.replaceSelection('Sample editor command');
-			},
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView =
-					this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-				return false;
-			},
-		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(activeDocument, 'click', (_evt: MouseEvent) => {
-			new Notice('Click');
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(
-			window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000),
-		);
-	}
-
-	onunload() {}
-
-	async loadSettings() {
-		this.settings = Object.assign(
-			{},
-			DEFAULT_SETTINGS,
-			(await this.loadData()) as Partial<MyPluginSettings>,
-		);
-	}
-
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
+interface PluginData {
+	settings: CalderaSyncSettings;
+	sync?: PersistedState;
 }
 
-class SampleModal extends Modal {
-	onOpen() {
-		const { contentEl } = this;
-		contentEl.setText('Woah!');
+const STATUS_LABEL: Record<SyncStatusInfo['kind'], string> = {
+	disabled: 'Caldera: off',
+	connecting: 'Caldera: connecting…',
+	reconciling: 'Caldera: reconciling…',
+	live: 'Caldera: live',
+	polling: 'Caldera: polling',
+	error: 'Caldera: error',
+};
+
+export default class CalderaSyncPlugin extends Plugin {
+	settings!: CalderaSyncSettings;
+	private state!: SyncState;
+	private engine: SyncEngine | null = null;
+	private statusEl: HTMLElement | null = null;
+
+	async onload(): Promise<void> {
+		await this.loadAll();
+
+		this.statusEl = this.addStatusBarItem();
+		this.setStatus({ kind: this.settings.enabled ? 'connecting' : 'disabled' });
+
+		this.addSettingTab(new CalderaSyncSettingTab(this.app, this));
+
+		this.addCommand({
+			id: 'sync-now',
+			name: 'Sync now',
+			callback: () => {
+				if (!this.engine) {
+					new Notice('Caldera Sync is not running. Enable it in settings.');
+					return;
+				}
+				void this.engine
+					.syncNow()
+					.then(() => new Notice('Caldera Sync: reconciled.'))
+					.catch((e) => new Notice(`Caldera Sync failed: ${String(e)}`));
+			},
+		});
+
+		// Local vault edits → server. Handlers no-op until the engine is running.
+		this.registerEvent(
+			this.app.vault.on('create', (f) => {
+				if (f instanceof TFile) this.engine?.queueLocalUpsert(f.path);
+			}),
+		);
+		this.registerEvent(
+			this.app.vault.on('modify', (f) => {
+				if (f instanceof TFile) this.engine?.queueLocalUpsert(f.path);
+			}),
+		);
+		this.registerEvent(
+			this.app.vault.on('delete', (f) => {
+				if (f instanceof TFile) this.engine?.handleLocalDelete(f.path);
+			}),
+		);
+		this.registerEvent(
+			this.app.vault.on('rename', (f, oldPath) => {
+				if (f instanceof TFile) this.engine?.handleLocalRename(oldPath, f.path);
+			}),
+		);
+
+		// Start after the workspace is ready so the initial reconcile doesn't race
+		// the vault still loading.
+		this.app.workspace.onLayoutReady(() => {
+			void this.startSync();
+		});
 	}
 
-	onClose() {
-		const { contentEl } = this;
-		contentEl.empty();
+	onunload(): void {
+		void this.stopSync();
+	}
+
+	// ── Sync lifecycle ────────────────────────────────────────────────
+	private async startSync(): Promise<void> {
+		if (!this.settings.enabled) {
+			this.setStatus({ kind: 'disabled' });
+			return;
+		}
+		if (!this.settings.serverUrl || !this.settings.apiKey) {
+			this.setStatus({ kind: 'error', detail: 'set server URL and API key' });
+			return;
+		}
+		const client = new CalderaClient(this.settings);
+		this.engine = new SyncEngine(this.app, this.settings, client, this.state, (s) =>
+			this.setStatus(s),
+		);
+		await this.engine.start();
+	}
+
+	private async stopSync(): Promise<void> {
+		if (this.engine) {
+			await this.engine.stop();
+			this.engine = null;
+		}
+	}
+
+	/** Called by the settings tab when a setting that affects sync changes. */
+	async restartSync(): Promise<void> {
+		await this.stopSync();
+		await this.startSync();
+	}
+
+	// ── Persistence ───────────────────────────────────────────────────
+	private async loadAll(): Promise<void> {
+		const raw = (await this.loadData()) as Partial<PluginData> | null;
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, raw?.settings);
+		this.state = new SyncState((s) => this.persist(s));
+		this.state.load(raw?.sync);
+	}
+
+	private async persist(sync: PersistedState): Promise<void> {
+		await this.saveData({ settings: this.settings, sync } satisfies PluginData);
+	}
+
+	async saveSettings(): Promise<void> {
+		await this.persist(this.state.snapshot());
+	}
+
+	// ── Status bar ────────────────────────────────────────────────────
+	private setStatus(info: SyncStatusInfo): void {
+		if (!this.statusEl) return;
+		const label = STATUS_LABEL[info.kind];
+		this.statusEl.setText(info.detail ? `${label} (${info.detail})` : label);
 	}
 }

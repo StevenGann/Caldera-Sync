@@ -30,4 +30,11 @@ export default tseslint.config(
 		},
 	},
 	...obsidianmd.configs.recommended,
+	{
+		// Our UI text contains proper nouns and acronyms (Caldera, SSE, API, URL)
+		// that the sentence-case rule rewrites incorrectly.
+		rules: {
+			'obsidianmd/ui/sentence-case': 'off',
+		},
+	},
 );

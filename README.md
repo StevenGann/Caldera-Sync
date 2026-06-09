@@ -1,92 +1,96 @@
-# Obsidian Sample Plugin
+# Caldera Sync
 
-This is a sample plugin for Obsidian (https://obsidian.md).
+An Obsidian plugin that mirrors your vault with a [Caldera](https://github.com/StevenGann/Caldera)
+server **in real time** over Caldera's REST API. Edits in Obsidian flow to
+Caldera (and on to its GitHub backup); changes an AI agent makes through Caldera
+flow back into Obsidian the instant they happen.
 
-This project uses TypeScript to provide type checking and documentation.
-The repo depends on the latest plugin API (obsidian.d.ts) in TypeScript Definition format, which contains TSDoc comments describing what it does.
+Because Obsidian stays in charge of its own files, you can keep using **Obsidian
+Sync**, iCloud, or any other sync for the vault itself — Caldera Sync only keeps
+Obsidian and the Caldera server in step with each other.
 
-This sample plugin demonstrates some of the basic functionality the plugin API can do.
+## How it works
 
-- Adds a ribbon icon, which shows a Notice when clicked.
-- Adds a command "Open modal (simple)" which opens a Modal.
-- Adds a plugin setting tab to the settings page.
-- Registers a global click event and outputs a Notice on click.
-- Registers a global interval which logs 'setInterval' to the console.
-
-## First time developing plugins?
-
-Quick starting guide for new plugin devs:
-
-- Check if [someone already developed a plugin for what you want](https://obsidian.md/plugins)! There might be an existing plugin similar enough that you can partner up with.
-- Make a copy of this repo as a template with the "Use this template" button (login to GitHub if you don't see it).
-- Clone your repo to a local development folder. For convenience, you can place this folder in your `.obsidian/plugins/your-plugin-name` folder.
-- Install NodeJS, then run `npm i` in the command line under your repo folder.
-- Run `npm run dev` to compile your plugin from `src/main.ts` to `main.js`.
-- Make changes to `src/main.ts` (or create new `.ts` files). Those changes should be automatically compiled into `main.js`.
-- Reload Obsidian to load the new version of your plugin.
-- Enable plugin in settings window.
-- For updates to the Obsidian API run `npm update` in the command line under your repo folder.
-
-## Releasing new releases
-
-- Update your `manifest.json` with your new version number, such as `1.0.1`, and the minimum Obsidian version required for your latest release.
-- Update your `versions.json` file with `"new-plugin-version": "minimum-obsidian-version"` so older versions of Obsidian can download an older version of your plugin that's compatible.
-- Create new GitHub release using your new version number as the "Tag version". Use the exact version number, don't include a prefix `v`. See here for an example: https://github.com/obsidianmd/obsidian-sample-plugin/releases
-- Upload the files `manifest.json`, `main.js`, `styles.css` as binary attachments. Note: The manifest.json file must be in two places, first the root path of your repository and also in the release.
-- Publish the release.
-
-> You can simplify the version bump process by running `npm version patch`, `npm version minor` or `npm version major` after updating `minAppVersion` manually in `manifest.json`.
-> The command will bump version in `manifest.json` and `package.json`, and add the entry for the new version to `versions.json`
-
-## Adding your plugin to the community plugin list
-
-- Check the [plugin guidelines](https://docs.obsidian.md/Plugins/Releasing/Plugin+guidelines).
-- Publish an initial version.
-- Make sure you have a `README.md` file in the root of your repo.
-- Make a pull request at https://github.com/obsidianmd/obsidian-releases to add your plugin.
-
-## How to use
-
-- Clone this repo.
-- Make sure your NodeJS is at least v18 (`node --version`).
-- `npm i` to install dependencies.
-- `npm run dev` to start compilation in watch mode.
-
-## Manually installing the plugin
-
-- Copy over `main.js`, `styles.css`, `manifest.json` to your vault `VaultFolder/.obsidian/plugins/your-plugin-id/`.
-
-## Improve code quality with eslint
-
-- [ESLint](https://eslint.org/) is a tool that analyzes your code to quickly find problems. You can run ESLint against your plugin to find common bugs and ways to improve your code.
-- This project already has eslint preconfigured, you can invoke a check by running`npm run lint`
-- Together with a custom eslint [plugin](https://github.com/obsidianmd/eslint-plugin) for Obsidan specific code guidelines.
-- A GitHub action is preconfigured to automatically lint every commit on all branches.
-
-## Funding URL
-
-You can include funding URLs where people who use your plugin can financially support it.
-
-The simple way is to set the `fundingUrl` field to your link in your `manifest.json` file:
-
-```json
-{
-	"fundingUrl": "https://buymeacoffee.com"
-}
+```
+   Obsidian  ⇄  Caldera Sync (this plugin)  ⇄  Caldera server  ⇄  GitHub
+      ⇅                                              ⇅
+ Obsidian Sync / iCloud / …                      AI agents
 ```
 
-If you have multiple URLs, you can also do:
+- **Local → server.** When you create, edit, rename, or delete a note, the
+  plugin pushes it to Caldera with an `If-Match` precondition (optimistic
+  concurrency).
+- **Server → local.** The plugin subscribes to Caldera's change stream
+  (`GET /api/v1/events`, Server-Sent Events) and applies upserts/deletes as they
+  arrive. On mobile, or if you prefer, it polls `GET /api/v1/changes` instead.
+- **Echo suppression.** Every change carries a `sha256` checksum. A change whose
+  checksum already matches what we have is recognised as our own echo and
+  skipped, so edits don't ping-pong.
+- **Conflicts.** If a note changed on both sides since the last sync, the plugin
+  resolves it per your setting — by default it keeps your version as a
+  `… (conflict <timestamp>).md` copy and adopts the server's version.
 
-```json
-{
-	"fundingUrl": {
-		"Buy Me a Coffee": "https://buymeacoffee.com",
-		"GitHub Sponsor": "https://github.com/sponsors",
-		"Patreon": "https://www.patreon.com/"
-	}
-}
+See [`docs/REALTIME_SYNC.md`](https://github.com/StevenGann/Caldera/blob/main/docs/REALTIME_SYNC.md)
+in the Caldera repo for the server-side contract.
+
+## Requirements
+
+- A running Caldera server reachable from your device, with an API key
+  (`CALDERA_API_KEYS`).
+- Obsidian 1.6.6 or newer.
+
+## Setup
+
+1. Install the plugin (see **Manual install** below) and enable it in
+   **Settings → Community plugins**.
+2. Open **Settings → Caldera Sync** and set:
+   - **Server URL** — e.g. `http://localhost:8000` (no trailing slash).
+   - **API key** — one of the server's `CALDERA_API_KEYS`.
+   - **Folder** — optional; restrict syncing to one folder. Leave empty for the
+     whole vault. Paths are preserved, so the server mirrors the same structure.
+   - **Live transport** — *SSE* for instant updates (desktop), or *Polling*
+     (works everywhere, including mobile).
+   - **Conflict handling** — keep both (default), prefer server, or prefer local.
+3. Toggle **Enable sync** on. The status bar shows the connection state
+   (`Caldera: live`, `polling`, `reconciling`, or an error).
+
+On first run the plugin reconciles the whole vault against the server (pulling,
+pushing, or flagging conflicts per note), then switches to the live feed.
+
+## Scope and limitations
+
+- **Markdown only.** Caldera indexes `*.md`; attachments (images, PDFs, etc.)
+  are not synced.
+- **Whole-file fidelity.** Notes are sent verbatim (frontmatter included) so the
+  checksum matches the server byte-for-byte and the sync loop settles. The
+  plugin never reformats your notes.
+- **One server per vault.** The plugin mirrors against a single Caldera server.
+
+## Development
+
+```bash
+npm install
+npm run dev     # watch build → main.js
+npm run build   # type-check + production bundle
+npm run lint
 ```
 
-## API Documentation
+Source layout:
 
-See https://docs.obsidian.md
+```
+src/
+  main.ts          plugin lifecycle, vault-event wiring, status bar
+  settings.ts      settings interface + settings tab
+  types.ts         shared types mirroring Caldera's API
+  api/client.ts    REST calls (manifest, raw get/put, delete)
+  api/events.ts    SSE stream + polling fallback
+  sync/engine.ts   bidirectional reconcile, echo suppression, conflicts
+  sync/state.ts    persisted per-note baseline checksums + stream cursor
+  util/hash.ts     sha256 matching Caldera's checksum format
+```
+
+## Manual install
+
+Copy `main.js`, `manifest.json`, and `styles.css` into
+`<Vault>/.obsidian/plugins/caldera-sync/`, then reload Obsidian and enable the
+plugin under **Settings → Community plugins**.
