@@ -39,3 +39,16 @@ export async function waitFor(
 		await new Promise((r) => setTimeout(r, interval));
 	}
 }
+
+/** Like waitFor, but the predicate is async (e.g. checks server state). */
+export async function waitForAsync(
+	predicate: () => Promise<boolean>,
+	{ timeout = 10000, interval = 100 }: { timeout?: number; interval?: number } = {},
+): Promise<void> {
+	const start = Date.now();
+	for (;;) {
+		if (await predicate()) return;
+		if (Date.now() - start > timeout) throw new Error('waitForAsync: timed out');
+		await new Promise((r) => setTimeout(r, interval));
+	}
+}

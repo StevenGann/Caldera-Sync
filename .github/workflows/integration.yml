@@ -16,9 +16,18 @@ on:
     branches: ['**']
   pull_request:
     branches: ['**']
+  # Nightly run against :edge catches drift when Caldera's main branch moves
+  # even if this repo hasn't changed.
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Caldera image ref to test against'
+        default: 'ghcr.io/stevengann/caldera:edge'
 
 env:
-  CALDERA_IMAGE: ghcr.io/stevengann/caldera:edge
+  CALDERA_IMAGE: ${{ github.event.inputs.image || 'ghcr.io/stevengann/caldera:edge' }}
   CALDERA_API_KEY: ci-integration-key-0001
 
 jobs:
