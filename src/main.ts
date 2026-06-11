@@ -20,6 +20,7 @@ const STATUS_LABEL: Record<SyncStatusInfo['kind'], string> = {
 	reconciling: 'Caldera: reconciling…',
 	live: 'Caldera: live',
 	polling: 'Caldera: polling',
+	paused: 'Caldera: paused ⚠',
 	error: 'Caldera: error',
 };
 
@@ -48,6 +49,21 @@ export default class CalderaSyncPlugin extends Plugin {
 				void this.engine
 					.syncNow()
 					.then(() => new Notice('Caldera Sync: reconciled.'))
+					.catch((e) => new Notice(`Caldera Sync failed: ${String(e)}`));
+			},
+		});
+
+		this.addCommand({
+			id: 'confirm-large-sync',
+			name: 'Confirm large sync',
+			callback: () => {
+				if (!this.engine) {
+					new Notice('Caldera Sync is not running. Enable it in settings.');
+					return;
+				}
+				new Notice('Caldera Sync: confirming large sync…');
+				void this.engine
+					.confirmLargeSync()
 					.catch((e) => new Notice(`Caldera Sync failed: ${String(e)}`));
 			},
 		});

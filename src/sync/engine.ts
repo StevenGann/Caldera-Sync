@@ -31,6 +31,8 @@ export class SyncEngine {
 	private pushTimers = new Map<string, number>();
 	/** Pending expiry timers for echo expectations, cleared on stop(). */
 	private echoTimers = new Set<number>();
+	/** One-shot bypass of the large-sync safety limit (set by the confirm command). */
+	private bypassLimitOnce = false;
 
 	constructor(
 		private app: App,
@@ -43,19 +45,35 @@ export class SyncEngine {
 	// ── Lifecycle ─────────────────────────────────────────────────────
 	async start(): Promise<void> {
 		this.onStatus({ kind: 'connecting' });
+		let result: 'ok' | 'paused';
 		try {
-			await this.withLock(() => this.reconcile());
+			result = await this.withLock(() => this.reconcile());
 		} catch (err) {
 			this.onStatus({ kind: 'error', detail: this.msg(err) });
 			return;
 		}
+		if (result === 'paused') return; // safety limit tripped — do not go live
+		this.startStream();
+	}
+
+	private startStream(): void {
+		if (this.stream) return;
 		this.stream = new ChangeStream(this.settings, this.client, {
 			onEvent: (ev) => this.withLock(() => this.applyEvent(ev)),
-			onResync: () => this.withLock(() => this.reconcile()),
+			onResync: () =>
+				this.withLock(() => this.reconcile()).then((r) => {
+					if (r === 'paused') this.stream?.stop(); // don't keep streaming past a tripped limit
+				}),
 			onStatus: (s) => this.onStatus(s),
 			getCursor: () => this.state.cursor,
 		});
 		this.stream.start();
+	}
+
+	/** User confirmed an over-limit sync — let the next reconcile through once. */
+	async confirmLargeSync(): Promise<void> {
+		this.bypassLimitOnce = true;
+		await this.start();
 	}
 
 	async stop(): Promise<void> {
@@ -75,13 +93,18 @@ export class SyncEngine {
 	}
 
 	// ── Reconcile (bootstrap / resync) ────────────────────────────────
-	private async reconcile(): Promise<void> {
+	private async reconcile(): Promise<'ok' | 'paused'> {
 		this.onStatus({ kind: 'reconciling' });
 		const manifest = await this.client.getManifest();
 		const remote = new Map(manifest.notes.map((n) => [normalizePath(n.path), n.checksum]));
-
 		const local = await this.hashLocalFiles();
 
+		// Build the full plan BEFORE touching anything, so a safety limit can veto
+		// a runaway batch. A mis-rooted server or a path-nesting bug can otherwise
+		// turn one reconcile into hundreds of creates/deletes (a commit storm).
+		type Action =
+			| 'pull' | 'pushLocal' | 'pushCreate' | 'trashLocal' | 'deleteRemote' | 'conflict' | 'baseline';
+		const plan: { path: string; action: Action; checksum?: string }[] = [];
 		const paths = new Set<string>([...remote.keys(), ...local.keys()]);
 		for (const path of paths) {
 			// Three-way compare: server checksum vs local checksum vs the baseline
@@ -90,29 +113,49 @@ export class SyncEngine {
 			const localSum = local.get(path);
 			const baseSum = this.state.get(path);
 			if (remoteSum && !localSum) {
-				// Present on server, missing locally.
 				if (baseSum !== undefined && baseSum === remoteSum)
-					await this.deleteRemote(path, remoteSum); // deleted locally while offline
-				else await this.pullToLocal(path);
+					plan.push({ path, action: 'deleteRemote', checksum: remoteSum }); // deleted locally while offline
+				else plan.push({ path, action: 'pull' });
 			} else if (!remoteSum && localSum) {
-				// Present locally, missing on server.
 				if (baseSum !== undefined && baseSum === localSum)
-					await this.trashLocal(path); // remote deleted while offline
-				else await this.pushCreate(path);
+					plan.push({ path, action: 'trashLocal' }); // remote deleted while offline
+				else plan.push({ path, action: 'pushCreate' });
 			} else if (remoteSum && localSum) {
-				if (remoteSum === localSum) {
-					this.state.set(path, remoteSum); // already identical
-				} else if (baseSum === remoteSum) {
-					await this.pushLocal(path); // only local changed
-				} else if (baseSum === localSum) {
-					await this.pullToLocal(path); // only remote changed
-				} else {
-					await this.resolveConflict(path); // both changed (or no baseline)
-				}
+				if (remoteSum === localSum) plan.push({ path, action: 'baseline', checksum: remoteSum });
+				else if (baseSum === remoteSum) plan.push({ path, action: 'pushLocal' });
+				else if (baseSum === localSum) plan.push({ path, action: 'pull' });
+				else plan.push({ path, action: 'conflict' });
+			}
+		}
+
+		// Circuit-breaker: refuse an over-limit batch unless the user confirmed.
+		const mutations = plan.filter((p) => p.action !== 'baseline');
+		const limit = this.settings.maxBatchChanges;
+		if (limit > 0 && mutations.length > limit && !this.bypassLimitOnce) {
+			this.onStatus({ kind: 'paused', detail: `${mutations.length} changes > ${limit} limit` });
+			new Notice(
+				`Caldera Sync paused: this sync would change ${mutations.length} files (limit ${limit}). ` +
+					`If expected (e.g. a first import), run "Caldera Sync: confirm large sync"; ` +
+					`otherwise check the server's vault root.`,
+			);
+			return 'paused';
+		}
+		this.bypassLimitOnce = false;
+
+		for (const item of plan) {
+			switch (item.action) {
+				case 'baseline': this.state.set(item.path, item.checksum as string); break;
+				case 'pull': await this.pullToLocal(item.path); break;
+				case 'pushLocal': await this.pushLocal(item.path); break;
+				case 'pushCreate': await this.pushCreate(item.path); break;
+				case 'trashLocal': await this.trashLocal(item.path); break;
+				case 'deleteRemote': await this.deleteRemote(item.path, item.checksum); break;
+				case 'conflict': await this.resolveConflict(item.path); break;
 			}
 		}
 		this.state.setCursor(manifest.head);
 		await this.state.flush();
+		return 'ok';
 	}
 
 	// ── Remote → local ────────────────────────────────────────────────

@@ -184,4 +184,29 @@ describe.skipIf(!hasServer)('SyncEngine ↔ Caldera (fake vault, live server)', 
 		expect(copy).toBeDefined();
 		expect(fake.getContent(copy as string)).toBe(local);
 	});
+
+	it('pauses an over-limit reconcile and applies it on confirm (storm guard)', async () => {
+		const folder = uniqueFolder();
+		const client = new CalderaClient(makeSettings({ folder }));
+		for (const n of ['a', 'b', 'c']) await client.putRaw(`${folder}/${n}.md`, `# ${n}\n`);
+
+		const fake = new FakeApp();
+		const state = new SyncState(async () => {});
+		const statuses: string[] = [];
+		const settings = makeSettings({ folder, maxBatchChanges: 2 });
+		const engine = new SyncEngine(fake.asApp(), settings, client, state, (s) => statuses.push(s.kind));
+		wire(fake, engine);
+
+		await engine.start();
+		started.push(engine);
+		// 3 pulls > limit of 2 → paused, nothing applied locally.
+		expect(statuses).toContain('paused');
+		expect(fake.paths().length).toBe(0);
+
+		// Confirm bypasses the limit once and applies all three.
+		await engine.confirmLargeSync();
+		await waitFor(() => fake.paths().filter((p) => p.startsWith(folder)).length === 3);
+
+		for (const n of ['a', 'b', 'c']) await client.deleteNote(`${folder}/${n}.md`);
+	});
 });

@@ -21,6 +21,13 @@ export interface CalderaSyncSettings {
 	pushDebounceMs: number;
 	/** What to do when local and remote both changed since the last sync. */
 	conflictStrategy: ConflictStrategy;
+	/**
+	 * Safety circuit-breaker: if a single reconcile would create/delete/overwrite
+	 * more than this many notes, pause and ask for confirmation instead of
+	 * applying it (guards against mis-rooted servers and path-nesting storms).
+	 * 0 disables the check.
+	 */
+	maxBatchChanges: number;
 }
 
 export const DEFAULT_SETTINGS: CalderaSyncSettings = {
@@ -32,6 +39,7 @@ export const DEFAULT_SETTINGS: CalderaSyncSettings = {
 	pollIntervalMs: 3000,
 	pushDebounceMs: 1200,
 	conflictStrategy: 'conflict-copy',
+	maxBatchChanges: 100,
 };
 
 export class CalderaSyncSettingTab extends PluginSettingTab {
@@ -170,6 +178,24 @@ export class CalderaSyncSettingTab extends PluginSettingTab {
 					.onChange(async (v) => {
 						this.plugin.settings.conflictStrategy = v as ConflictStrategy;
 						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName('Large-sync safety limit')
+			.setDesc(
+				'Pause and ask before a single sync changes more than this many notes ' +
+					'(guards against a mis-rooted server flooding the vault). 0 disables it.',
+			)
+			.addText((t) =>
+				t
+					.setValue(String(this.plugin.settings.maxBatchChanges))
+					.onChange(async (v) => {
+						const n = Number(v);
+						if (Number.isInteger(n) && n >= 0) {
+							this.plugin.settings.maxBatchChanges = n;
+							await this.plugin.saveSettings();
+						}
 					}),
 			);
 	}

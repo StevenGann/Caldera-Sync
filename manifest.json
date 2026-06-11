@@ -1,7 +1,7 @@
 {
 	"id": "caldera-sync",
 	"name": "Caldera Sync",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"minAppVersion": "1.6.6",
 	"description": "Mirror this vault in real time with a Caldera server over its REST API, so agents and Obsidian share one vault.",
 	"author": "Steven Gann",

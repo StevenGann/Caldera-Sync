@@ -46,6 +46,7 @@ export type SyncStatusKind =
 	| 'reconciling'
 	| 'live'
 	| 'polling'
+	| 'paused'
 	| 'error';
 
 export interface SyncStatusInfo {
