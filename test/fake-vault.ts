@@ -69,6 +69,14 @@ export class FakeApp {
 			this.files.delete(file.path);
 			this.emit('delete', this.tfile(file.path));
 		},
+		renameFile: async (file: TFile, newPath: string): Promise<TFile> => {
+			const oldPath = file.path;
+			const content = this.files.get(oldPath) ?? '';
+			this.files.delete(oldPath);
+			this.files.set(newPath, content);
+			this.emit('rename', this.tfile(newPath), oldPath);
+			return this.tfile(newPath);
+		},
 	};
 
 	// ── Test-side helpers (simulate the user editing in Obsidian) ──────

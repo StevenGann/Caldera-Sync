@@ -157,6 +157,24 @@ describe.skipIf(!hasServer)('SyncEngine ↔ Caldera (fake vault, live server)', 
 		expect((await client.getRaw(renamed))?.content).toBe(content);
 	});
 
+	it('renames a punctuated local create to a sync-safe name (local → remote)', async () => {
+		const folder = uniqueFolder();
+		const { client, fake } = await setup(folder);
+		const dirty = `${folder}/Notes: why?.md`;
+		const clean = `${folder}/Notes why.md`;
+		const content = '# punctuated local note\n';
+
+		// A user can only create this on Linux/macOS — Windows refuses outright.
+		fake.putLocal(dirty, content);
+
+		// The plugin renames it in the vault and pushes the corrected name.
+		await waitFor(() => fake.has(clean));
+		expect(fake.paths().filter((p) => p === dirty)).toHaveLength(0);
+		await waitForAsync(async () => (await client.getRaw(clean))?.content === content);
+		// The punctuated name must never reach the server.
+		expect(await client.getRaw(dirty)).toBe(null);
+	});
+
 	it('keeps both sides on a conflict (conflict-copy)', async () => {
 		const folder = uniqueFolder();
 		const path = `${folder}/conf.md`;
