@@ -1,4 +1,5 @@
 import { App, Notice, TFile, normalizePath } from 'obsidian';
+import { sanitizeVaultPath } from '../util/filename';
 import type { CalderaSyncSettings } from '../settings';
 import type { CalderaClient } from '../api/client';
 import { ChangeStream } from '../api/events';
@@ -164,7 +165,10 @@ export class SyncEngine {
 			this.state.setCursor(ev.seq);
 			return;
 		}
-		const path = normalizePath(ev.path);
+		// Normalise here, at the single point where a remote path enters the
+		// engine: the echo expectation, the conflict baseline, this.state's keys
+		// and the file actually written must all agree on one canonical name.
+		const path = sanitizeVaultPath(normalizePath(ev.path));
 		if (ev.type === 'delete') {
 			if (this.state.get(path) !== undefined || this.localFile(path)) {
 				await this.trashLocal(path);
@@ -212,6 +216,15 @@ export class SyncEngine {
 	// ── Local → remote (debounced from vault events) ──────────────────
 	queueLocalUpsert(path: string): void {
 		if (!this.inScope(path)) return;
+		if (sanitizeVaultPath(path) !== path) {
+			// The vault is the only place a punctuated name can appear — the
+			// server normalises everything written to it. Rename the file here
+			// and let that event queue the push under the clean name; pushing
+			// the original would have the server store a different name than
+			// the client holds, and the two ends would disagree indefinitely.
+			void this.cleanLocalName(path);
+			return;
+		}
 		const existing = this.pushTimers.get(path);
 		if (existing) window.clearTimeout(existing);
 		this.pushTimers.set(
@@ -225,16 +238,35 @@ export class SyncEngine {
 
 	handleLocalDelete(path: string): void {
 		if (!this.inScope(path)) return;
-		if (this.consumeEcho(path, ECHO_DELETE)) return; // our own remote-applied delete
-		const timer = this.pushTimers.get(path);
+		// Both this.state and the remote side are keyed by the canonical name.
+		const key = sanitizeVaultPath(path);
+		if (this.consumeEcho(key, ECHO_DELETE)) return; // our own remote-applied delete
+		const timer = this.pushTimers.get(key);
 		if (timer) {
 			window.clearTimeout(timer);
-			this.pushTimers.delete(path);
+			this.pushTimers.delete(key);
 		}
-		void this.withLock(() => this.deleteRemote(path, this.state.get(path)));
+		void this.withLock(() => this.deleteRemote(key, this.state.get(key)));
 	}
 
 	handleLocalRename(oldPath: string, newPath: string): void {
+		// A note can be renamed to a punctuated name on Linux/macOS (Windows
+		// refuses outright). Clean it in the vault first, so the push carries
+		// the same name the server would store, then run the normal
+		// delete-old/create-new pass against the corrected path.
+		const clean = sanitizeVaultPath(newPath);
+		if (clean !== newPath) {
+			void this.cleanLocalName(newPath).then((applied) => {
+				// `applied` is the cleaned path on success, or `newPath` when the
+				// rename was refused (the clean name is already taken).
+				this.runLocalRename(oldPath, applied);
+			});
+			return;
+		}
+		this.runLocalRename(oldPath, newPath);
+	}
+
+	private runLocalRename(oldPath: string, newPath: string): void {
 		// Modeled as delete-old + create-new; Caldera rewrites of links arrive as
 		// their own upsert events. (Server-side move is intentionally not used to
 		// avoid double link-rewriting against Obsidian's own.) Both halves run as a
@@ -409,6 +441,35 @@ export class SyncEngine {
 		else await this.app.vault.create(normalizePath(path), content);
 	}
 
+	/**
+	 * Rename a vault file whose name breaks the cross-platform policy, and
+	 * return the path callers should use instead.
+	 *
+	 * Returns `path` unchanged when it is already clean, when no such file
+	 * exists, or when the clean name is already taken — in that last case it
+	 * refuses loudly rather than overwriting, because silently merging two
+	 * notes would lose data.
+	 */
+	private async cleanLocalName(path: string): Promise<string> {
+		const clean = sanitizeVaultPath(path);
+		if (clean === path) return path;
+		const file = this.localFile(path);
+		if (!file) return clean;
+		if (this.app.vault.getAbstractFileByPath(normalizePath(clean))) {
+			new Notice(`Caldera Sync: cannot rename "${path}" — "${clean}" already exists.`);
+			return path;
+		}
+		try {
+			await this.ensureFolder(clean);
+			await this.app.fileManager.renameFile(file, normalizePath(clean));
+			new Notice(`Caldera Sync: renamed "${path}" to "${clean}".`);
+			return clean;
+		} catch (err) {
+			new Notice(`Caldera Sync: could not rename "${path}": ${String(err)}`);
+			return path;
+		}
+	}
+
 	private async trashLocal(path: string): Promise<void> {
 		const file = this.localFile(path);
 		if (file) {
@@ -442,7 +503,9 @@ export class SyncEngine {
 		const ts = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
 		const dot = path.lastIndexOf('.');
 		const stem = dot >= 0 ? path.slice(0, dot) : path;
-		return normalizePath(`${stem} (conflict ${ts}).md`);
+		// Brackets are punctuation: run the generated name through the policy so
+		// a conflict copy syncs rather than bouncing off the server.
+		return sanitizeVaultPath(`${stem} conflict ${ts}.md`);
 	}
 
 	// ── Echo guard ────────────────────────────────────────────────────

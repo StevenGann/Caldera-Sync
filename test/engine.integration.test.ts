@@ -66,7 +66,7 @@ describe.skipIf(!hasServer)('SyncEngine ↔ Caldera (fake vault, live server)', 
 
 		// Give the SSE echo time to arrive and (correctly) be ignored.
 		await new Promise((r) => setTimeout(r, 600));
-		expect(fake.paths().filter((p) => p.includes('(conflict'))).toHaveLength(0);
+		expect(fake.paths().filter((p) => p.includes('conflict'))).toHaveLength(0);
 		expect(fake.paths().filter((p) => p === path)).toHaveLength(1);
 		expect((await client.getRaw(path))?.content).toBe(content);
 	});
@@ -113,7 +113,7 @@ describe.skipIf(!hasServer)('SyncEngine ↔ Caldera (fake vault, live server)', 
 		await client.putRaw(path, content, (await client.getRaw(path))?.checksum);
 		await new Promise((r) => setTimeout(r, 700));
 
-		expect(fake.paths().filter((p) => p.includes('(conflict'))).toHaveLength(0);
+		expect(fake.paths().filter((p) => p.includes('conflict'))).toHaveLength(0);
 		expect(fake.getContent(path)).toBe(content);
 	});
 
@@ -153,7 +153,7 @@ describe.skipIf(!hasServer)('SyncEngine ↔ Caldera (fake vault, live server)', 
 		await waitForAsync(async () => (await client.getRaw(renamed))?.content === content);
 		await waitForAsync(async () => (await client.getRaw(remotePath)) === null);
 
-		expect(fake.paths().filter((p) => p.includes('(conflict'))).toHaveLength(0);
+		expect(fake.paths().filter((p) => p.includes('conflict'))).toHaveLength(0);
 		expect((await client.getRaw(renamed))?.content).toBe(content);
 	});
 
@@ -180,7 +180,7 @@ describe.skipIf(!hasServer)('SyncEngine ↔ Caldera (fake vault, live server)', 
 
 		// Remote adopted into the real path; local kept as a conflict copy.
 		await waitFor(() => fake.getContent(path) === remote);
-		const copy = fake.paths().find((p) => p.includes('(conflict'));
+		const copy = fake.paths().find((p) => p.includes('conflict'));
 		expect(copy).toBeDefined();
 		expect(fake.getContent(copy as string)).toBe(local);
 	});
