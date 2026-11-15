@@ -5,6 +5,7 @@ import type { CalderaClient } from '../api/client';
 import { ChangeStream } from '../api/events';
 import type { SyncState } from './state';
 import { checksum } from '../util/hash';
+import { isGeneratedOnlyDifference, mergeGenerated } from './generated';
 import type { ChangeEvent, RawNote, SyncStatusInfo } from '../types';
 
 /**
@@ -192,7 +193,16 @@ export class SyncEngine {
 				return;
 			}
 			if (local !== this.state.get(path)) {
-				// Local has unsynced edits and the server changed too → conflict.
+				// Local has unsynced edits and the server changed too. If the two
+				// copies differ only inside a generated (Waypoint) region, that is
+				// plugin churn rather than a conflict: merge it silently.
+				const remote = await this.client.getRaw(path);
+				if (remote && isGeneratedOnlyDifference(content, remote.content)) {
+					if (await this.mergeGeneratedRegions(path, content, remote)) return;
+					// Push rejected: take the ordinary conflict path, once.
+					await this.resolveConflict(path, false);
+					return;
+				}
 				await this.resolveConflict(path);
 				return;
 			}
@@ -330,7 +340,12 @@ export class SyncEngine {
 	}
 
 	// ── Conflict resolution ───────────────────────────────────────────
-	private async resolveConflict(path: string): Promise<void> {
+	/**
+	 * Resolve a two-sided change. `mergeGenerated` = false skips the
+	 * generated-region merge; it is used when that merge was just attempted and
+	 * its push was rejected, so the fallback cannot loop back into it.
+	 */
+	private async resolveConflict(path: string, mergeGenerated = true): Promise<void> {
 		const localContent = await this.readLocal(path);
 		const remote = await this.client.getRaw(path);
 
@@ -341,6 +356,16 @@ export class SyncEngine {
 		}
 		if (localContent === null) {
 			await this.adoptRemote(path, remote); // nothing local to keep
+			return;
+		}
+
+		// Differences confined to a generated (Waypoint) region are not a
+		// conflict: merge them, so no strategy — notably conflict-copy — runs.
+		if (mergeGenerated && isGeneratedOnlyDifference(localContent, remote.content)) {
+			if (await this.mergeGeneratedRegions(path, localContent, remote)) return;
+			// Merge push rejected: the server moved again, so `remote` is stale.
+			// Re-run against fresh copies with the merge disabled — exactly once.
+			await this.resolveConflict(path, false);
 			return;
 		}
 
@@ -362,6 +387,33 @@ export class SyncEngine {
 				break;
 			}
 		}
+	}
+
+	/**
+	 * Merge a note whose local and remote copies differ only inside generated
+	 * regions. Silent by design (no Notice): this is routine Waypoint churn.
+	 * Returns false when the server rejected the merged push (409/412) so the
+	 * caller can fall back to ordinary conflict handling.
+	 */
+	private async mergeGeneratedRegions(path: string, localContent: string, remote: RawNote): Promise<boolean> {
+		const merged = mergeGenerated(localContent, remote.content);
+		if (merged === remote.content) {
+			await this.adoptRemote(path, remote);
+			return true;
+		}
+		// Push before touching the vault: if the server rejects it, the local file
+		// is still the user's own copy for the conflict fallback to preserve.
+		const mergedSum = await checksum(merged);
+		const ifMatch = remote.checksum || (await checksum(remote.content));
+		const res = await this.client.putRaw(path, merged, ifMatch);
+		if (!res.ok) return false;
+		const serverSum = res.checksum ?? mergedSum;
+		if (merged !== localContent) {
+			this.expectEcho(path, mergedSum); // the modify event is ours, not a user edit
+			await this.writeLocal(path, merged);
+		}
+		this.state.set(path, serverSum);
+		return true;
 	}
 
 	// ── Vault helpers ─────────────────────────────────────────────────

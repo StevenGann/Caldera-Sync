@@ -72,6 +72,18 @@ to force a full resync after being offline.
   plugin never reformats your notes.
 - **One server per vault.** The plugin mirrors against a single Caldera server.
 
+## Known plugin interactions
+
+- **Waypoint and similar folder-index plugins are supported.** Waypoint rewrites
+  the `%% Begin Waypoint %% … %% End Waypoint %%` block of a folder note whenever
+  the folder changes, so two devices running it regenerate the same hub notes
+  independently. When the only difference between your copy and the server's is
+  inside that generated block, the plugin merges the two instead of creating a
+  conflict copy: text outside the block comes from the server, and the block
+  keeps the list entries from both sides. This happens silently, with no notice.
+  A real edit to the hand-written part of the note is still handled as a
+  conflict under your **Conflict handling** setting.
+
 ## Privacy
 
 - **What's sent.** The full contents of every in-scope note — including
@@ -113,6 +125,7 @@ src/
   api/events.ts    SSE stream + polling fallback
   sync/engine.ts   bidirectional reconcile, echo suppression, conflicts
   sync/state.ts    persisted per-note baseline checksums + stream cursor
+  sync/generated.ts  Waypoint generated-region detection + merge
   util/hash.ts     sha256 matching Caldera's checksum format
 ```
 
